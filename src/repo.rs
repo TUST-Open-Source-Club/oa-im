@@ -240,7 +240,7 @@ pub async fn list_conversations(
             });
         }
     }
-    result.sort_by(|a, b| b.conversation.updated_at.cmp(&a.conversation.updated_at));
+    result.sort_by_key(|row| std::cmp::Reverse(row.conversation.updated_at));
     Ok(result)
 }
 
@@ -392,6 +392,18 @@ pub async fn update_last_read(
 /// 未读数。
 pub fn unread_for(conversation: &conversation::Model, member: &conversation_member::Model) -> i64 {
     unread_of(conversation.next_seq, member.last_read_seq)
+}
+
+/// 标记消息已撤回。
+pub async fn mark_recalled(
+    db: &DatabaseConnection,
+    model: &message::Model,
+    now: DateTime<Utc>,
+) -> Result<message::Model, AppError> {
+    let mut active: message::ActiveModel = model.clone().into();
+    active.status = Set("recalled".to_string());
+    active.recalled_at = Set(Some(now.fixed_offset()));
+    active.update(db).await.map_err(map_db_err)
 }
 
 /// 查询某会话某序号的消息是否存在（引用校验用）。

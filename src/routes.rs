@@ -12,7 +12,6 @@ use uuid::Uuid;
 use club_auth_sdk::AuthUser;
 use club_common::{AppError, FieldError};
 
-use crate::domain;
 use crate::entity::{conversation, conversation_member, message};
 use crate::repo;
 use crate::state::SharedState;
@@ -262,7 +261,7 @@ pub struct SendMessageRequest {
     pub reply_to_id: Option<Uuid>,
 }
 
-/// `POST /conversations/{id}/messages`：发送消息（HTTP 通道；WS 后续接入）。
+/// `POST /conversations/{id}/messages`：发送消息（HTTP 通道）。
 pub async fn send_message(
     State(state): State<SharedState>,
     auth: AuthUser,
@@ -270,72 +269,20 @@ pub async fn send_message(
     Json(input): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<MessageDto>), AppError> {
     let user_id = user_id_of(&auth)?;
-    domain::validate_message(&input.kind, &input.content)?;
-    let ctx = repo::get_conversation_for_member(&state.db, conversation_id, user_id).await?;
-    if let Some(reply_to_id) = input.reply_to_id {
-        if repo::find_message(&state.db, conversation_id, reply_to_id)
-            .await?
-            .is_none()
-        {
-            return Err(AppError::unprocessable(
-                "IM_VALIDATION",
-                "引用的消息不存在",
-                vec![FieldError::new("replyToId", "消息不存在")],
-            ));
-        }
-    }
-
-    let now = state.now();
-    let (model, created) = repo::insert_message(
-        &state.db,
-        repo::NewMessage {
-            conversation_id,
-            sender_id: user_id,
-            kind: input.kind.clone(),
-            content: input.content.clone(),
-            reply_to_id: input.reply_to_id,
-            client_msg_id: input.client_msg_id,
-        },
-        now,
+    let (model, created) = crate::service::create_message(
+        &state,
+        user_id,
+        conversation_id,
+        &input.kind,
+        &input.content,
+        input.reply_to_id,
+        input.client_msg_id,
     )
     .await?;
-
     if created {
-        // 仅当配置了事件总线时才写 outbox（由后台投递器发送，避免堆积无消费者的数据）
-        if state.bus.is_some() {
-            let members = repo::list_members(&state.db, conversation_id).await?;
-            let targets: Vec<String> = members
-                .iter()
-                .filter(|m| m.user_id != user_id)
-                .map(|m| m.user_id.to_string())
-                .collect();
-            let title = match ctx.conversation.r#type.as_str() {
-                conversation::TYPE_GROUP => ctx
-                    .conversation
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "群聊".to_string()),
-                _ => "新消息".to_string(),
-            };
-            let payload = json!({
-                "id": model.id,
-                "type": "im.message.created",
-                "actorId": user_id,
-                "targetUsers": targets,
-                "resource": { "type": "im", "id": conversation_id, "url": format!("/im/{conversation_id}") },
-                "title": title,
-                "body": domain::preview_of(&model.r#type, &model.content),
-                "priority": "high"
-            });
-            if let Err(err) =
-                club_bus::outbox::enqueue(&state.db, "im.message.created", &payload, now).await
-            {
-                tracing::warn!(error = %err, "消息事件写入 outbox 失败");
-            }
-        }
-        tracing::info!(conversation = %conversation_id, seq = model.seq, "消息已发送");
+        // 推送给在线的 WebSocket 客户端
+        crate::realtime::broadcast_message(&state, conversation_id, &model).await;
     }
-
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -360,8 +307,41 @@ pub async fn mark_read(
     Json(input): Json<ReadRequest>,
 ) -> Result<Json<Value>, AppError> {
     let user_id = user_id_of(&auth)?;
-    let member = repo::update_last_read(&state.db, conversation_id, user_id, input.seq).await?;
+    let member = crate::service::apply_read(&state, user_id, conversation_id, input.seq).await?;
     Ok(Json(json!({ "lastReadSeq": member.last_read_seq })))
+}
+
+/// `POST /conversations/{id}/messages/{message_id}/recall`：撤回消息并广播。
+pub async fn recall_message(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((conversation_id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<MessageDto>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let model =
+        crate::service::recall_message(&state, user_id, conversation_id, message_id).await?;
+    let members = repo::list_members(&state.db, conversation_id).await?;
+    let event = serde_json::json!({
+        "type": "message_recalled",
+        "payload": { "conversationId": conversation_id, "messageId": message_id }
+    })
+    .to_string();
+    for member in members {
+        state.hub.send_to(member.user_id, &event);
+    }
+    Ok(Json(MessageDto::from(&model)))
+}
+
+/// `GET /conversations/{id}/messages/{message_id}/receipts`：已读回执。
+pub async fn message_receipts(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((conversation_id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let receipts =
+        crate::service::read_receipts(&state, user_id, conversation_id, message_id).await?;
+    Ok(Json(json!(receipts)))
 }
 
 /// `GET /conversations/{id}/members`：成员列表。
@@ -465,6 +445,14 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/conversations/{id}/messages",
             get(list_messages).post(send_message),
+        )
+        .route(
+            "/conversations/{id}/messages/{message_id}/recall",
+            post(recall_message),
+        )
+        .route(
+            "/conversations/{id}/messages/{message_id}/receipts",
+            get(message_receipts),
         )
         .route(
             "/conversations/{id}/members",

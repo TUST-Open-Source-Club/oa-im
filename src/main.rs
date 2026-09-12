@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         bus: bus.clone(),
         signing_key: RwLock::new(None),
+        hub: Default::default(),
     });
     load_jwks_with_retry(&state).await?;
 

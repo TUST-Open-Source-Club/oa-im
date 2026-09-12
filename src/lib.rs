@@ -30,6 +30,16 @@ pub mod config {
         /// 从环境变量加载。
         pub fn from_env() -> anyhow::Result<Self> {
             let map: HashMap<String, String> = std::env::vars().collect();
+            Self::from_map(map)
+        }
+
+        /// 从键值映射加载（测试用）。
+        pub fn from_env_from_map(map: HashMap<String, String>) -> Self {
+            Self::from_map(map).expect("测试配置")
+        }
+
+        /// 从键值映射构建配置。
+        fn from_map(map: HashMap<String, String>) -> anyhow::Result<Self> {
             Ok(Self {
                 database_url: map
                     .get("DATABASE_URL")
@@ -100,6 +110,8 @@ pub mod state {
         pub bus: Option<Bus>,
         /// JWKS 解码 key。
         pub signing_key: RwLock<Option<DecodingKey>>,
+        /// 在线连接注册表。
+        pub hub: crate::realtime::Hub,
     }
 
     impl AppState {
@@ -164,9 +176,13 @@ pub mod state {
 pub mod domain;
 pub mod entity;
 pub mod migration;
+/// WebSocket 实时通道。
+pub mod realtime;
 pub mod repo;
 /// HTTP 路由。
 pub mod routes;
+/// 消息领域服务。
+pub mod service;
 
 use axum::Router;
 use tower_http::trace::TraceLayer;
@@ -178,6 +194,7 @@ pub fn build_router(state: SharedState) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(routes::healthz))
         .route("/readyz", axum::routing::get(routes::readyz))
+        .route("/ws/im", axum::routing::get(realtime::ws_handler))
         .nest("/api/v1/im", routes::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
