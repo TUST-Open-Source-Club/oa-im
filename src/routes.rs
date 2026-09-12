@@ -1,0 +1,478 @@
+//! HTTP 路由。
+
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use chrono::{DateTime, FixedOffset};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use club_auth_sdk::AuthUser;
+use club_common::{AppError, FieldError};
+
+use crate::domain;
+use crate::entity::{conversation, conversation_member, message};
+use crate::repo;
+use crate::state::SharedState;
+
+/// 存活检查。
+pub async fn healthz() -> Json<Value> {
+    Json(json!({ "status": "ok" }))
+}
+
+/// 就绪检查。
+pub async fn readyz(State(state): State<SharedState>) -> Json<Value> {
+    match state.db.ping().await {
+        Ok(_) => Json(json!({ "status": "ready", "database": "ok" })),
+        Err(err) => {
+            tracing::error!(error = %err, "数据库就绪检查失败");
+            Json(json!({ "status": "degraded", "database": "error" }))
+        }
+    }
+}
+
+/// 解析登录用户 ID。
+fn user_id_of(auth: &AuthUser) -> Result<Uuid, AppError> {
+    auth.claims()
+        .sub
+        .parse()
+        .map_err(|_| AppError::unauthorized("AUTH_INVALID_TOKEN", "访问令牌无效"))
+}
+
+/// 消息 DTO。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageDto {
+    /// ID。
+    pub id: String,
+    /// 会话内序号。
+    pub seq: i64,
+    /// 发送者。
+    pub sender_id: Option<String>,
+    /// 类型。
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// 内容。
+    pub content: Value,
+    /// 引用消息。
+    pub reply_to_id: Option<String>,
+    /// 状态。
+    pub status: String,
+    /// 时间。
+    pub created_at: DateTime<FixedOffset>,
+}
+
+impl From<&message::Model> for MessageDto {
+    fn from(model: &message::Model) -> Self {
+        Self {
+            id: model.id.to_string(),
+            seq: model.seq,
+            sender_id: model.sender_id.map(|id| id.to_string()),
+            kind: model.r#type.clone(),
+            content: model.content.clone(),
+            reply_to_id: model.reply_to_id.map(|id| id.to_string()),
+            status: model.status.clone(),
+            created_at: model.created_at,
+        }
+    }
+}
+
+/// 会话 DTO。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationDto {
+    /// ID。
+    pub id: String,
+    /// 类型。
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// 名称。
+    pub name: Option<String>,
+    /// 公告。
+    pub notice: Option<String>,
+    /// 未读数。
+    pub unread: i64,
+    /// 是否免打扰。
+    pub muted: bool,
+    /// 是否置顶。
+    pub pinned: bool,
+    /// 成员 ID。
+    pub member_ids: Vec<String>,
+    /// 最近一条消息预览。
+    pub last_message: Option<MessageDto>,
+    /// 更新时间。
+    pub updated_at: DateTime<FixedOffset>,
+}
+
+/// `GET /conversations`：会话列表。
+pub async fn list_conversations(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+) -> Result<Json<Vec<ConversationDto>>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let rows = repo::list_conversations(&state.db, user_id).await?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let members = repo::list_members(&state.db, row.conversation.id).await?;
+        let last = repo::list_messages(&state.db, row.conversation.id, None, 1).await?;
+        items.push(ConversationDto {
+            id: row.conversation.id.to_string(),
+            kind: row.conversation.r#type.clone(),
+            name: row.conversation.name.clone(),
+            notice: row.conversation.notice.clone(),
+            unread: repo::unread_for(&row.conversation, &row.member),
+            muted: row.member.muted,
+            pinned: row.member.pinned,
+            member_ids: members.iter().map(|m| m.user_id.to_string()).collect(),
+            last_message: last.first().map(MessageDto::from),
+            updated_at: row.conversation.updated_at,
+        });
+    }
+    Ok(Json(items))
+}
+
+/// 创建会话请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateConversationRequest {
+    /// direct / group。
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// 其他成员。
+    pub member_ids: Vec<Uuid>,
+    /// 群名（群聊必填）。
+    pub name: Option<String>,
+}
+
+/// `POST /conversations`：创建单聊/群聊（单聊幂等）。
+pub async fn create_conversation(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Json(input): Json<CreateConversationRequest>,
+) -> Result<(StatusCode, Json<ConversationDto>), AppError> {
+    let user_id = user_id_of(&auth)?;
+    let now = state.now();
+    let (conversation, created) = match input.kind.as_str() {
+        conversation::TYPE_DIRECT => {
+            let other = input.member_ids.first().ok_or_else(|| {
+                AppError::unprocessable(
+                    "IM_VALIDATION",
+                    "单聊需要一个对方用户",
+                    vec![FieldError::new("memberIds", "不能为空")],
+                )
+            })?;
+            repo::create_direct_conversation(&state.db, user_id, *other, now).await?
+        }
+        conversation::TYPE_GROUP => {
+            let name = input
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty());
+            let Some(name) = name else {
+                return Err(AppError::unprocessable(
+                    "IM_VALIDATION",
+                    "群聊名称不能为空",
+                    vec![FieldError::new("name", "不能为空")],
+                ));
+            };
+            if input.member_ids.is_empty() {
+                return Err(AppError::unprocessable(
+                    "IM_VALIDATION",
+                    "群聊至少邀请一位成员",
+                    vec![FieldError::new("memberIds", "不能为空")],
+                ));
+            }
+            let conv =
+                repo::create_group_conversation(&state.db, user_id, &input.member_ids, name, now)
+                    .await?;
+            (conv, true)
+        }
+        _ => {
+            return Err(AppError::unprocessable(
+                "IM_VALIDATION",
+                "会话类型不合法",
+                vec![FieldError::new("type", "仅支持 direct / group")],
+            ))
+        }
+    };
+
+    let members = repo::list_members(&state.db, conversation.id).await?;
+    let member = repo::find_member(&state.db, conversation.id, user_id)
+        .await?
+        .ok_or_else(|| AppError::internal("创建会话后成员记录缺失"))?;
+    let response = ConversationDto {
+        id: conversation.id.to_string(),
+        kind: conversation.r#type.clone(),
+        name: conversation.name.clone(),
+        notice: conversation.notice.clone(),
+        unread: repo::unread_for(&conversation, &member),
+        muted: member.muted,
+        pinned: member.pinned,
+        member_ids: members.iter().map(|m| m.user_id.to_string()).collect(),
+        last_message: None,
+        updated_at: conversation.updated_at,
+    };
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(response)))
+}
+
+/// 历史消息查询。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageQuery {
+    /// 拉取该序号之前（不含）。
+    pub before_seq: Option<i64>,
+    /// 条数。
+    pub limit: Option<u64>,
+}
+
+/// `GET /conversations/{id}/messages`：历史消息。
+pub async fn list_messages(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<Uuid>,
+    Query(query): Query<MessageQuery>,
+) -> Result<Json<Vec<MessageDto>>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    repo::get_conversation_for_member(&state.db, conversation_id, user_id).await?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let items = repo::list_messages(&state.db, conversation_id, query.before_seq, limit).await?;
+    Ok(Json(items.iter().map(MessageDto::from).collect()))
+}
+
+/// 发送消息请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessageRequest {
+    /// 客户端幂等 ID。
+    pub client_msg_id: Option<String>,
+    /// 类型。
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// 内容。
+    pub content: Value,
+    /// 引用。
+    pub reply_to_id: Option<Uuid>,
+}
+
+/// `POST /conversations/{id}/messages`：发送消息（HTTP 通道；WS 后续接入）。
+pub async fn send_message(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<Uuid>,
+    Json(input): Json<SendMessageRequest>,
+) -> Result<(StatusCode, Json<MessageDto>), AppError> {
+    let user_id = user_id_of(&auth)?;
+    domain::validate_message(&input.kind, &input.content)?;
+    let ctx = repo::get_conversation_for_member(&state.db, conversation_id, user_id).await?;
+    if let Some(reply_to_id) = input.reply_to_id {
+        if repo::find_message(&state.db, conversation_id, reply_to_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::unprocessable(
+                "IM_VALIDATION",
+                "引用的消息不存在",
+                vec![FieldError::new("replyToId", "消息不存在")],
+            ));
+        }
+    }
+
+    let now = state.now();
+    let (model, created) = repo::insert_message(
+        &state.db,
+        repo::NewMessage {
+            conversation_id,
+            sender_id: user_id,
+            kind: input.kind.clone(),
+            content: input.content.clone(),
+            reply_to_id: input.reply_to_id,
+            client_msg_id: input.client_msg_id,
+        },
+        now,
+    )
+    .await?;
+
+    if created {
+        // 仅当配置了事件总线时才写 outbox（由后台投递器发送，避免堆积无消费者的数据）
+        if state.bus.is_some() {
+            let members = repo::list_members(&state.db, conversation_id).await?;
+            let targets: Vec<String> = members
+                .iter()
+                .filter(|m| m.user_id != user_id)
+                .map(|m| m.user_id.to_string())
+                .collect();
+            let title = match ctx.conversation.r#type.as_str() {
+                conversation::TYPE_GROUP => ctx
+                    .conversation
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "群聊".to_string()),
+                _ => "新消息".to_string(),
+            };
+            let payload = json!({
+                "id": model.id,
+                "type": "im.message.created",
+                "actorId": user_id,
+                "targetUsers": targets,
+                "resource": { "type": "im", "id": conversation_id, "url": format!("/im/{conversation_id}") },
+                "title": title,
+                "body": domain::preview_of(&model.r#type, &model.content),
+                "priority": "high"
+            });
+            if let Err(err) =
+                club_bus::outbox::enqueue(&state.db, "im.message.created", &payload, now).await
+            {
+                tracing::warn!(error = %err, "消息事件写入 outbox 失败");
+            }
+        }
+        tracing::info!(conversation = %conversation_id, seq = model.seq, "消息已发送");
+    }
+
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(MessageDto::from(&model))))
+}
+
+/// 已读请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadRequest {
+    /// 已读到该序号（含）。
+    pub seq: i64,
+}
+
+/// `POST /conversations/{id}/read`：上报已读位点。
+pub async fn mark_read(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<Uuid>,
+    Json(input): Json<ReadRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let member = repo::update_last_read(&state.db, conversation_id, user_id, input.seq).await?;
+    Ok(Json(json!({ "lastReadSeq": member.last_read_seq })))
+}
+
+/// `GET /conversations/{id}/members`：成员列表。
+pub async fn list_members(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    repo::get_conversation_for_member(&state.db, conversation_id, user_id).await?;
+    let members = repo::list_members(&state.db, conversation_id).await?;
+    let items: Vec<Value> = members
+        .iter()
+        .map(|m| {
+            json!({
+                "userId": m.user_id,
+                "role": m.role,
+                "lastReadSeq": m.last_read_seq,
+                "joinedAt": m.joined_at
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
+}
+
+/// 添加成员请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddMembersRequest {
+    /// 用户 ID 列表。
+    pub user_ids: Vec<Uuid>,
+}
+
+/// `POST /conversations/{id}/members`：邀请成员（仅群聊，群主/管理员）。
+pub async fn add_members(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<Uuid>,
+    Json(input): Json<AddMembersRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let ctx = repo::get_conversation_for_member(&state.db, conversation_id, user_id).await?;
+    if ctx.conversation.r#type != conversation::TYPE_GROUP {
+        return Err(AppError::bad_request("IM_NOT_GROUP", "单聊不能添加成员"));
+    }
+    if !matches!(
+        ctx.member.role.as_str(),
+        conversation_member::ROLE_OWNER | conversation_member::ROLE_ADMIN
+    ) {
+        return Err(AppError::forbidden(
+            "IM_FORBIDDEN",
+            "仅群主/管理员可邀请成员",
+        ));
+    }
+    let now = state.now();
+    let mut added = 0;
+    for member_id in &input.user_ids {
+        repo::insert_member(
+            &state.db,
+            conversation_id,
+            *member_id,
+            conversation_member::ROLE_MEMBER,
+            now,
+        )
+        .await?;
+        added += 1;
+    }
+    Ok(Json(json!({ "added": added })))
+}
+
+/// `DELETE /conversations/{id}/members/{userId}`：移出成员或主动退群。
+pub async fn remove_member(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((conversation_id, target_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let ctx = repo::get_conversation_for_member(&state.db, conversation_id, user_id).await?;
+    let is_self = user_id == target_id;
+    let can_manage = matches!(
+        ctx.member.role.as_str(),
+        conversation_member::ROLE_OWNER | conversation_member::ROLE_ADMIN
+    );
+    if !is_self && !can_manage {
+        return Err(AppError::forbidden(
+            "IM_FORBIDDEN",
+            "仅群主/管理员可移出成员",
+        ));
+    }
+    repo::remove_member(&state.db, conversation_id, target_id, state.now()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `/api/v1/im` 路由。
+pub fn router() -> Router<SharedState> {
+    Router::new()
+        .route(
+            "/conversations",
+            get(list_conversations).post(create_conversation),
+        )
+        .route(
+            "/conversations/{id}/messages",
+            get(list_messages).post(send_message),
+        )
+        .route(
+            "/conversations/{id}/members",
+            get(list_members).post(add_members),
+        )
+        .route(
+            "/conversations/{id}/members/{user_id}",
+            delete(remove_member),
+        )
+        .route("/conversations/{id}/read", post(mark_read))
+}

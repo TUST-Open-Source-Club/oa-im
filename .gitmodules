@@ -1,0 +1,3 @@
+[submodule "libs"]
+	path = libs
+	url = https://github.com/TUST-Open-Source-Club/oa-libs.git
