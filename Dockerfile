@@ -1,5 +1,5 @@
 # 构建阶段：利用 Cargo.lock 锁定依赖；libs 为仓库内嵌子模块
-FROM rust:1.98-slim AS builder
+FROM rust:1.98-slim-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked
