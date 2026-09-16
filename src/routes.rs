@@ -121,6 +121,7 @@ pub async fn list_conversations(
             kind: row.conversation.r#type.clone(),
             name: row.conversation.name.clone(),
             notice: row.conversation.notice.clone(),
+            only_admins_speak: row.conversation.only_admins_speak,
             unread: repo::unread_for(&row.conversation, &row.member),
             muted: row.member.muted,
             pinned: row.member.pinned,
@@ -594,6 +595,8 @@ pub async fn list_members(
                 "userId": m.user_id,
                 "role": m.role,
                 "lastReadSeq": m.last_read_seq,
+                "mutedUntil": m.muted_until,
+                "canSpeak": m.can_speak,
                 "joinedAt": m.joined_at
             })
         })
