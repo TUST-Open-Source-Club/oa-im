@@ -91,6 +91,8 @@ pub struct ConversationDto {
     pub name: Option<String>,
     /// 公告。
     pub notice: Option<String>,
+    /// 是否仅管理员可发言。
+    pub only_admins_speak: bool,
     /// 未读数。
     pub unread: i64,
     /// 是否免打扰。
@@ -208,6 +210,7 @@ pub async fn create_conversation(
         kind: conversation.r#type.clone(),
         name: conversation.name.clone(),
         notice: conversation.notice.clone(),
+        only_admins_speak: conversation.only_admins_speak,
         unread: repo::unread_for(&conversation, &member),
         muted: member.muted,
         pinned: member.pinned,
