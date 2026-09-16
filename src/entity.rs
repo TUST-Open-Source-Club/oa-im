@@ -27,6 +27,8 @@ pub mod conversation {
         /// 群公告。
         #[sea_orm(nullable, column_type = "Text")]
         pub notice: Option<String>,
+        /// 仅管理员/白名单成员可发言。
+        pub only_admins_speak: bool,
         /// 已分配的最大消息序号（unread 计算基准）。
         pub next_seq: i64,
         /// 创建时间。
@@ -69,6 +71,11 @@ pub mod conversation_member {
         pub last_read_seq: i64,
         /// 消息免打扰。
         pub muted: bool,
+        /// 禁言到期时间（None = 未禁言）。
+        #[sea_orm(nullable)]
+        pub muted_until: Option<DateTimeWithTimeZone>,
+        /// 是否允许发言（配合 only_admins_speak 白名单）。
+        pub can_speak: bool,
         /// 置顶。
         pub pinned: bool,
         /// 加入时间。

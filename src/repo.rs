@@ -85,6 +85,7 @@ pub async fn create_direct_conversation(
         owner_id: Set(None),
         notice: Set(None),
         next_seq: Set(0),
+        only_admins_speak: Set(false),
         created_at: Set(now.fixed_offset()),
         updated_at: Set(now.fixed_offset()),
     }
@@ -120,6 +121,7 @@ pub async fn create_group_conversation(
         owner_id: Set(Some(owner_id)),
         notice: Set(None),
         next_seq: Set(0),
+        only_admins_speak: Set(false),
         created_at: Set(now.fixed_offset()),
         updated_at: Set(now.fixed_offset()),
     }
@@ -173,6 +175,8 @@ pub async fn insert_member(
         user_id: Set(user_id),
         role: Set(role.to_string()),
         last_read_seq: Set(0),
+        muted_until: Set(None),
+        can_speak: Set(true),
         muted: Set(false),
         pinned: Set(false),
         joined_at: Set(now.fixed_offset()),

@@ -176,6 +176,7 @@ pub mod state {
 pub mod domain;
 pub mod entity;
 pub mod migration;
+pub mod migration2;
 /// WebSocket 实时通道。
 pub mod realtime;
 pub mod repo;
