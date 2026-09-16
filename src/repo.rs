@@ -429,3 +429,110 @@ pub async fn find_message(
 pub fn sender_condition(sender_id: Uuid) -> Condition {
     Condition::all().add(message::Column::SenderId.eq(sender_id))
 }
+
+/// 设置成员禁言到期时间。
+pub async fn set_member_mute(
+    db: &DatabaseConnection,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    muted_until: Option<DateTime<Utc>>,
+) -> Result<conversation_member::Model, AppError> {
+    let member = find_member(db, conversation_id, user_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("IM_MEMBER_NOT_FOUND", "成员不存在"))?;
+    let mut active: conversation_member::ActiveModel = member.into();
+    active.muted_until = Set(muted_until.map(|value| value.fixed_offset()));
+    active.update(db).await.map_err(map_db_err)
+}
+
+/// 设置成员发言白名单。
+pub async fn set_member_speak(
+    db: &DatabaseConnection,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    can_speak: bool,
+) -> Result<conversation_member::Model, AppError> {
+    let member = find_member(db, conversation_id, user_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("IM_MEMBER_NOT_FOUND", "成员不存在"))?;
+    let mut active: conversation_member::ActiveModel = member.into();
+    active.can_speak = Set(can_speak);
+    active.update(db).await.map_err(map_db_err)
+}
+
+/// 设置成员角色（owner/admin/member）。
+pub async fn set_member_role(
+    db: &DatabaseConnection,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+) -> Result<conversation_member::Model, AppError> {
+    let member = find_member(db, conversation_id, user_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("IM_MEMBER_NOT_FOUND", "成员不存在"))?;
+    let mut active: conversation_member::ActiveModel = member.into();
+    active.role = Set(role.to_string());
+    active.update(db).await.map_err(map_db_err)
+}
+
+/// 更新群设置（仅管理员发言/公告）。
+pub async fn update_group_settings(
+    db: &DatabaseConnection,
+    conversation: &conversation::Model,
+    only_admins_speak: Option<bool>,
+    notice: Option<Option<String>>,
+    now: DateTime<Utc>,
+) -> Result<conversation::Model, AppError> {
+    let mut active: conversation::ActiveModel = conversation.clone().into();
+    if let Some(value) = only_admins_speak {
+        active.only_admins_speak = Set(value);
+    }
+    if let Some(value) = notice {
+        active.notice = Set(value);
+    }
+    active.updated_at = Set(now.fixed_offset());
+    active.update(db).await.map_err(map_db_err)
+}
+
+/// 转让群主：原群主降为管理员，新群主升为 owner。
+pub async fn transfer_owner(
+    db: &DatabaseConnection,
+    conversation: &conversation::Model,
+    new_owner: Uuid,
+    now: DateTime<Utc>,
+) -> Result<conversation::Model, AppError> {
+    if let Some(old_owner) = conversation.owner_id {
+        if old_owner == new_owner {
+            return Ok(conversation.clone());
+        }
+        set_member_role(db, conversation.id, old_owner, "admin").await?;
+    }
+    set_member_role(db, conversation.id, new_owner, "owner").await?;
+    let mut active: conversation::ActiveModel = conversation.clone().into();
+    active.owner_id = Set(Some(new_owner));
+    active.updated_at = Set(now.fixed_offset());
+    active.update(db).await.map_err(map_db_err)
+}
+
+/// 解散群聊：删除消息与成员关系，然后删除会话。
+pub async fn dissolve_conversation(
+    db: &DatabaseConnection,
+    conversation_id: Uuid,
+) -> Result<(), AppError> {
+    use crate::entity::message;
+    message::Entity::delete_many()
+        .filter(message::Column::ConversationId.eq(conversation_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    conversation_member::Entity::delete_many()
+        .filter(conversation_member::Column::ConversationId.eq(conversation_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    conversation::Entity::delete_by_id(conversation_id)
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    Ok(())
+}

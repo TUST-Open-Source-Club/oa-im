@@ -269,6 +269,19 @@ pub async fn send_message(
     Json(input): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<MessageDto>), AppError> {
     let user_id = user_id_of(&auth)?;
+    // 群管理校验：禁言 / 仅管理员发言
+    let ctx = repo::get_conversation_for_member(&state.db, conversation_id, user_id).await?;
+    if ctx.conversation.r#type == "group" {
+        if let Some(until) = ctx.member.muted_until {
+            if until > state.now().fixed_offset() {
+                return Err(AppError::forbidden("IM_MUTED", "你已被禁言，暂时无法发言"));
+            }
+        }
+        let privileged = matches!(ctx.member.role.as_str(), "owner" | "admin");
+        if ctx.conversation.only_admins_speak && !privileged && !ctx.member.can_speak {
+            return Err(AppError::forbidden("IM_READONLY_GROUP", "当前群仅管理员可发言"));
+        }
+    }
     let (model, created) = crate::service::create_message(
         &state,
         user_id,
@@ -309,6 +322,227 @@ pub async fn mark_read(
     let user_id = user_id_of(&auth)?;
     let member = crate::service::apply_read(&state, user_id, conversation_id, input.seq).await?;
     Ok(Json(json!({ "lastReadSeq": member.last_read_seq })))
+}
+
+
+/// 群管理操作请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MuteRequest {
+    /// 禁言到期时间（null 解除禁言）。
+    pub muted_until: Option<DateTime<chrono::FixedOffset>>,
+}
+
+/// 发言白名单请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakRequest {
+    /// 是否允许发言。
+    pub can_speak: bool,
+}
+
+/// 群设置请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSettingsRequest {
+    /// 仅管理员/白名单可发言。
+    pub only_admins_speak: Option<bool>,
+    /// 群公告（null 清空）。
+    #[serde(default, deserialize_with = "double_option")]
+    pub notice: Option<Option<String>>,
+}
+
+/// 角色请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleRequest {
+    /// admin / member。
+    pub role: String,
+}
+
+/// 转让群主请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferRequest {
+    /// 新群主。
+    pub user_id: Uuid,
+}
+
+/// 三态 JSON。
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// 校验当前用户为群主/管理员，返回（会话, 成员）。
+async fn ensure_group_admin(
+    state: &SharedState,
+    conversation_id: Uuid,
+    user_id: Uuid,
+) -> Result<(conversation::Model, conversation_member::Model), AppError> {
+    let ctx = repo::get_conversation_for_member(&state.db, conversation_id, user_id).await?;
+    if ctx.conversation.r#type != "group" {
+        return Err(AppError::unprocessable(
+            "IM_VALIDATION",
+            "仅群聊支持该操作",
+            vec![],
+        ));
+    }
+    if !matches!(ctx.member.role.as_str(), "owner" | "admin") {
+        return Err(AppError::forbidden("IM_FORBIDDEN_GROUP", "仅群主/管理员可操作"));
+    }
+    Ok((ctx.conversation, ctx.member))
+}
+
+/// `POST /conversations/{id}/members/{uid}/mute`：禁言/解除禁言。
+pub async fn mute_member(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((conversation_id, target_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<MuteRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let (conversation, operator) = ensure_group_admin(&state, conversation_id, user_id).await?;
+    if operator.role == "admin" && conversation.owner_id == Some(target_id) {
+        return Err(AppError::forbidden("IM_FORBIDDEN_GROUP", "不能禁言群主"));
+    }
+    let member = repo::set_member_mute(
+        &state.db,
+        conversation_id,
+        target_id,
+        input.muted_until.map(|value| value.with_timezone(&chrono::Utc)),
+    )
+    .await?;
+    let event = serde_json::json!({
+        "type": "member_muted",
+        "payload": { "conversationId": conversation_id, "userId": target_id, "mutedUntil": member.muted_until }
+    })
+    .to_string();
+    state.hub.send_to(target_id, &event);
+    Ok(Json(json!({ "userId": target_id, "mutedUntil": member.muted_until })))
+}
+
+/// `POST /conversations/{id}/members/{uid}/speak`：发言白名单。
+pub async fn set_member_speak(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((conversation_id, target_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<SpeakRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    ensure_group_admin(&state, conversation_id, user_id).await?;
+    let member = repo::set_member_speak(&state.db, conversation_id, target_id, input.can_speak).await?;
+    Ok(Json(json!({ "userId": target_id, "canSpeak": member.can_speak })))
+}
+
+/// `POST /conversations/{id}/settings`：群设置。
+pub async fn update_group_settings(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<Uuid>,
+    Json(input): Json<GroupSettingsRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let (conversation, _) = ensure_group_admin(&state, conversation_id, user_id).await?;
+    let updated = repo::update_group_settings(
+        &state.db,
+        &conversation,
+        input.only_admins_speak,
+        input.notice,
+        state.now(),
+    )
+    .await?;
+    Ok(Json(json!({
+        "onlyAdminsSpeak": updated.only_admins_speak,
+        "notice": updated.notice
+    })))
+}
+
+/// `POST /conversations/{id}/members/{uid}/role`：设置/取消管理员（仅群主）。
+pub async fn set_member_role(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((conversation_id, target_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<RoleRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let (conversation, operator) = ensure_group_admin(&state, conversation_id, user_id).await?;
+    if operator.role != "owner" {
+        return Err(AppError::forbidden("IM_FORBIDDEN_GROUP", "仅群主可设置管理员"));
+    }
+    if !["admin", "member"].contains(&input.role.as_str()) {
+        return Err(AppError::unprocessable(
+            "IM_VALIDATION",
+            "角色不合法",
+            vec![FieldError::new("role", "仅支持 admin/member")],
+        ));
+    }
+    if conversation.owner_id == Some(target_id) {
+        return Err(AppError::forbidden("IM_FORBIDDEN_GROUP", "不能修改群主角色"));
+    }
+    let member = repo::set_member_role(&state.db, conversation_id, target_id, &input.role).await?;
+    let members = repo::list_members(&state.db, conversation_id).await?;
+    let event = serde_json::json!({
+        "type": "my_role_updated",
+        "payload": { "conversationId": conversation_id, "role": member.role }
+    })
+    .to_string();
+    state.hub.send_to(target_id, &event);
+    let _ = members;
+    Ok(Json(json!({ "userId": target_id, "role": member.role })))
+}
+
+/// `POST /conversations/{id}/transfer`：转让群主（仅群主）。
+pub async fn transfer_owner(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<Uuid>,
+    Json(input): Json<TransferRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let (conversation, operator) = ensure_group_admin(&state, conversation_id, user_id).await?;
+    if operator.role != "owner" {
+        return Err(AppError::forbidden("IM_FORBIDDEN_GROUP", "仅群主可转让群主"));
+    }
+    let updated = repo::transfer_owner(&state.db, &conversation, input.user_id, state.now()).await?;
+    let event = serde_json::json!({
+        "type": "owner_transferred",
+        "payload": { "conversationId": conversation_id, "ownerId": input.user_id }
+    })
+    .to_string();
+    let members = repo::list_members(&state.db, conversation_id).await?;
+    for member in members {
+        state.hub.send_to(member.user_id, &event);
+    }
+    Ok(Json(json!({ "ownerId": updated.owner_id })))
+}
+
+/// `DELETE /conversations/{id}`：解散群聊（仅群主）。
+pub async fn dissolve_conversation(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(conversation_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let (conversation, operator) = ensure_group_admin(&state, conversation_id, user_id).await?;
+    if operator.role != "owner" {
+        return Err(AppError::forbidden("IM_FORBIDDEN_GROUP", "仅群主可解散群聊"));
+    }
+    let members = repo::list_members(&state.db, conversation_id).await?;
+    repo::dissolve_conversation(&state.db, conversation_id).await?;
+    let _ = conversation;
+    let event = serde_json::json!({
+        "type": "conversation_dissolved",
+        "payload": { "conversationId": conversation_id }
+    })
+    .to_string();
+    for member in members {
+        state.hub.send_to(member.user_id, &event);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /conversations/{id}/messages/{message_id}/recall`：撤回消息并广播。
@@ -463,4 +697,22 @@ pub fn router() -> Router<SharedState> {
             delete(remove_member),
         )
         .route("/conversations/{id}/read", post(mark_read))
+        .route(
+            "/conversations/{id}/members/{user_id}/mute",
+            post(mute_member),
+        )
+        .route(
+            "/conversations/{id}/members/{user_id}/speak",
+            post(set_member_speak),
+        )
+        .route("/conversations/{id}/settings", post(update_group_settings))
+        .route(
+            "/conversations/{id}/members/{user_id}/role",
+            post(set_member_role),
+        )
+        .route("/conversations/{id}/transfer", post(transfer_owner))
+        .route(
+            "/conversations/{id}",
+            axum::routing::delete(dissolve_conversation),
+        )
 }
