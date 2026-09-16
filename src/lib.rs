@@ -196,6 +196,9 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/readyz", axum::routing::get(routes::readyz))
         .route("/ws/im", axum::routing::get(realtime::ws_handler))
         .nest("/api/v1/im", routes::router())
+        .layer(axum::middleware::from_fn(|req, next| {
+            club_auth_sdk::guard::guard_bot_request(req, next, "im")
+        }))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
